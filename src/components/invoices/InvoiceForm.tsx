@@ -1,0 +1,505 @@
+"use client";
+
+// InvoiceForm — constructor de facturas con líneas dinámicas.
+//
+// Conceptos clave:
+// - useFieldArray(): de React Hook Form, maneja arrays dinámicos (líneas de servicio).
+//   Permite agregar/remover/reordenar filas sin re-renderizar todo el form.
+// - watch(): observa valores del form en tiempo real para calcular totales.
+// - Los totales se calculan en el cliente para feedback inmediato,
+//   pero se RE-CALCULAN en el servidor (Server Action) para seguridad.
+
+import { useForm, useFieldArray, useWatch, Controller } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useTransition, useState, useMemo } from "react";
+import { invoiceSchema, type InvoiceFormData } from "@/lib/validations";
+import { formatClientName } from "@/lib/client-name";
+import {
+  calculateTaxBreakdown,
+  DEFAULT_COMBINED_TAX_RATE,
+  TPS_RATE,
+  TVQ_RATE,
+} from "@/lib/taxes";
+import { INVOICE_LANGUAGES } from "@/lib/invoice-i18n";
+import { Plus, Trash2 } from "lucide-react";
+import { LineItemDescriptionInput } from "@/components/invoices/LineItemDescriptionInput";
+import { FORM_LINE_ITEM_TYPES } from "@/lib/line-item-types";
+import Decimal from "decimal.js";
+
+// Tipos de los datos que necesita el form (vienen del servidor)
+interface Client {
+  id: string;
+  firstName: string;
+  lastName?: string | null;
+  vehicles: { id: string; make: string; model: string; year: number; licensePlate: string }[];
+}
+
+interface BillingProfileOption {
+  id: string;
+  legalName: string;
+  invoicePrefix: string;
+  isDefault: boolean;
+}
+
+interface InvoiceFormProps {
+  clients: Client[];
+  billingProfiles: BillingProfileOption[];
+  onSubmit: (data: InvoiceFormData) => Promise<{ error?: Record<string, string[]> } | void>;
+  initialValues?: Partial<InvoiceFormData>;
+  mode?: "create" | "edit";
+  variant?: "invoice" | "quote";
+}
+
+const TAX_RATE = DEFAULT_COMBINED_TAX_RATE;
+
+const ITEM_TYPES = FORM_LINE_ITEM_TYPES;
+
+export function InvoiceForm({
+  clients,
+  billingProfiles,
+  onSubmit,
+  initialValues,
+  mode = "create",
+  variant = "invoice",
+}: InvoiceFormProps) {
+  const defaultProfileId =
+    billingProfiles.find((p) => p.isDefault)?.id ?? billingProfiles[0]?.id ?? "";
+  const isQuote = variant === "quote";
+  const cancelHref = isQuote ? "/quotes" : "/invoices";
+  const [isPending, startTransition] = useTransition();
+
+  const {
+    register,
+    control,
+    handleSubmit,
+    watch,
+    setValue,
+    setError,
+    formState: { errors },
+  } = useForm<InvoiceFormData>({
+    resolver: zodResolver(invoiceSchema),
+    defaultValues: {
+      billingProfileId: defaultProfileId,
+      clientId: "",
+      vehicleId: "",
+      projectName: "",
+      taxRate: TAX_RATE,
+      language: "ES",
+      notes: "",
+      dueAt: "",
+      lineItems: [
+        { description: "", quantity: 1, unitPrice: 0, itemType: "DEVELOPMENT", warrantyTerm: "" },
+      ],
+      ...initialValues,
+    },
+  });
+
+  // useFieldArray maneja el array de líneas dinámicas
+  const { fields, append, remove } = useFieldArray({
+    control,
+    name: "lineItems",
+  });
+
+  const lineItems = useWatch({ control, name: "lineItems" });
+  const taxRate = watch("taxRate");
+
+  // Calcular totales en tiempo real
+  const { subtotal, tpsAmount, tvqAmount, taxAmount, total } = useMemo(() => {
+    const sub = (lineItems ?? []).reduce((sum, item) => {
+      const qty = Number(item?.quantity) || 0;
+      const price = Number(item?.unitPrice) || 0;
+      return sum.plus(new Decimal(qty).times(price));
+    }, new Decimal(0));
+    const rate = taxRate ?? TAX_RATE;
+    const { tpsAmount: tps, tvqAmount: tvq, taxAmount: tax } = calculateTaxBreakdown(sub, rate);
+    return {
+      subtotal: sub,
+      tpsAmount: tps,
+      tvqAmount: tvq,
+      taxAmount: tax,
+      total: sub.plus(tax),
+    };
+  }, [lineItems, taxRate]);
+
+  const effectiveRate = taxRate ?? TAX_RATE;
+  const taxFactor = new Decimal(effectiveRate).div(TPS_RATE + TVQ_RATE);
+  const tpsPct = new Decimal(TPS_RATE).times(taxFactor).times(100).toFixed(2);
+  const tvqPct = new Decimal(TVQ_RATE).times(taxFactor).times(100).toFixed(2);
+  const combinedPct = new Decimal(effectiveRate).times(100).toFixed(2);
+
+  async function onValid(data: InvoiceFormData) {
+    startTransition(async () => {
+      const result = await onSubmit(data);
+      if (result?.error) {
+        for (const [field, messages] of Object.entries(result.error)) {
+          setError(field as keyof InvoiceFormData, { message: messages[0] });
+        }
+      }
+    });
+  }
+
+  return (
+    <form onSubmit={handleSubmit(onValid)} className="space-y-6">
+
+      {/* ── Empresa, cliente y proyecto ── */}
+      <div className="bg-white rounded-xl border border-slate-200 p-5 space-y-4">
+        <h2 className="font-semibold text-slate-900">
+          {isQuote ? "Empresa, cliente y validez" : "Empresa y cliente"}
+        </h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">
+              Facturar como *
+            </label>
+            <select
+              {...register("billingProfileId")}
+              className={selectClass(!!errors.billingProfileId)}
+            >
+              <option value="">Seleccionar empresa...</option>
+              {billingProfiles.map((profile) => (
+                <option key={profile.id} value={profile.id}>
+                  {profile.legalName} ({profile.invoicePrefix})
+                </option>
+              ))}
+            </select>
+            {errors.billingProfileId && (
+              <p className="text-red-600 text-xs mt-1">{errors.billingProfileId.message}</p>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">
+              Cliente *
+            </label>
+            <select
+              {...register("clientId")}
+              className={selectClass(!!errors.clientId)}
+            >
+              <option value="">Seleccionar cliente...</option>
+              {clients.map((client) => (
+                <option key={client.id} value={client.id}>
+                  {formatClientName(client)}
+                </option>
+              ))}
+            </select>
+            {errors.clientId && (
+              <p className="text-red-600 text-xs mt-1">{errors.clientId.message}</p>
+            )}
+          </div>
+
+          <div className="sm:col-span-2">
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">
+              Proyecto / referencia (opcional)
+            </label>
+            <input
+              {...register("projectName")}
+              type="text"
+              placeholder="Sitio web Acme, App móvil, retainer mensual..."
+              className={inputClass(false)}
+            />
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">
+              {isQuote ? "Válida hasta" : "Fecha de vencimiento"}
+            </label>
+            <input
+              {...register("dueAt")}
+              type="date"
+              className={inputClass(false)}
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-slate-700 mb-1.5">
+              {isQuote ? "Idioma de la cotización *" : "Idioma de la factura *"}
+            </label>
+            <select {...register("language")} className={selectClass(!!errors.language)}>
+              {INVOICE_LANGUAGES.map((lang) => (
+                <option key={lang.value} value={lang.value}>
+                  {lang.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Líneas de servicio ── */}
+      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <div className="px-5 py-4 border-b border-slate-100">
+          <h2 className="font-semibold text-slate-900">Servicios</h2>
+          {errors.lineItems?.root && (
+            <p className="text-red-600 text-xs mt-1">{errors.lineItems.root.message}</p>
+          )}
+        </div>
+
+        {/* Header de la tabla */}
+        <div className="hidden sm:grid grid-cols-[1fr_120px_90px_100px_110px_80px_36px] gap-3 px-5 py-2 bg-slate-50 border-b border-slate-100">
+          <span className="text-xs font-medium text-slate-500 uppercase">Descripción</span>
+          <span className="text-xs font-medium text-slate-500 uppercase">Tipo</span>
+          <span className="text-xs font-medium text-slate-500 uppercase">Garantía</span>
+          <span className="text-xs font-medium text-slate-500 uppercase text-right">Cantidad</span>
+          <span className="text-xs font-medium text-slate-500 uppercase text-right">P. unitario</span>
+          <span className="text-xs font-medium text-slate-500 uppercase text-right">Total</span>
+          <span />
+        </div>
+
+        {/* Filas de líneas */}
+        <div className="divide-y divide-slate-100">
+          {fields.map((field, index) => {
+            const qty = Number(lineItems?.[index]?.quantity) || 0;
+            const price = Number(lineItems?.[index]?.unitPrice) || 0;
+            const lineTotal = new Decimal(qty).times(price);
+
+            return (
+              <div
+                key={field.id}
+                className="grid grid-cols-[1fr_36px] sm:grid-cols-[1fr_120px_90px_100px_110px_80px_36px] gap-3 px-5 py-3 items-start"
+              >
+                {/* Descripción */}
+                <div>
+                  <Controller
+                    control={control}
+                    name={`lineItems.${index}.description`}
+                    render={({ field }) => (
+                      <LineItemDescriptionInput
+                        value={field.value}
+                        onChange={field.onChange}
+                        onSelectSuggestion={(s) => {
+                          field.onChange(s.description);
+                          setValue(
+                            `lineItems.${index}.itemType`,
+                            s.itemType as InvoiceFormData["lineItems"][number]["itemType"]
+                          );
+                          setValue(`lineItems.${index}.unitPrice`, s.unitPrice);
+                        }}
+                        hasError={!!errors.lineItems?.[index]?.description}
+                        inputClass={inputClass(!!errors.lineItems?.[index]?.description)}
+                      />
+                    )}
+                  />
+                  {errors.lineItems?.[index]?.description && (
+                    <p className="text-red-600 text-xs mt-1">
+                      {errors.lineItems[index]?.description?.message}
+                    </p>
+                  )}
+                  <input
+                    {...register(`lineItems.${index}.warrantyTerm`)}
+                    type="text"
+                    placeholder="Garantía ej: 12 meses"
+                    className={`${inputClass(false)} text-xs mt-2 sm:hidden`}
+                  />
+                  {/* Mobile: Tipo, Cantidad, Precio en columna */}
+                  <div className="sm:hidden grid grid-cols-3 gap-2 mt-2">
+                    <select
+                      {...register(`lineItems.${index}.itemType`)}
+                      className={`${selectClass(false)} text-xs py-1.5`}
+                    >
+                      {ITEM_TYPES.map((t) => (
+                        <option key={t.value} value={t.value}>{t.label}</option>
+                      ))}
+                    </select>
+                    <input
+                      {...register(`lineItems.${index}.quantity`, { valueAsNumber: true })}
+                      type="number"
+                      min={0}
+                      step="0.5"
+                      placeholder="1"
+                      className={`${inputClass(false)} text-xs py-1.5`}
+                    />
+                    <input
+                      {...register(`lineItems.${index}.unitPrice`, { valueAsNumber: true })}
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      placeholder="0.00"
+                      className={`${inputClass(false)} text-xs py-1.5`}
+                    />
+                  </div>
+                </div>
+
+                {/* Tipo (desktop) */}
+                <select
+                  {...register(`lineItems.${index}.itemType`)}
+                  className={`${selectClass(false)} hidden sm:block`}
+                >
+                  {ITEM_TYPES.map((t) => (
+                    <option key={t.value} value={t.value}>{t.label}</option>
+                  ))}
+                </select>
+
+                {/* Garantía (desktop) */}
+                <input
+                  {...register(`lineItems.${index}.warrantyTerm`)}
+                  type="text"
+                  placeholder="12 meses"
+                  className={`${inputClass(false)} hidden sm:block text-xs`}
+                />
+
+                {/* Cantidad (desktop) */}
+                <input
+                  {...register(`lineItems.${index}.quantity`, { valueAsNumber: true })}
+                  type="number"
+                  min={0}
+                  step="0.5"
+                  placeholder="1"
+                  className={`${inputClass(false)} text-right hidden sm:block`}
+                />
+
+                {/* Precio unitario (desktop) */}
+                <div className="hidden sm:block relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm">$</span>
+                  <input
+                    {...register(`lineItems.${index}.unitPrice`, { valueAsNumber: true })}
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    placeholder="0.00"
+                    className={`${inputClass(false)} pl-6 text-right`}
+                  />
+                </div>
+
+                {/* Total de línea (solo lectura) */}
+                <div className="hidden sm:flex items-center justify-end">
+                  <span className="text-sm font-medium text-slate-900">
+                    ${lineTotal.toFixed(2)}
+                  </span>
+                </div>
+
+                {/* Botón eliminar */}
+                <button
+                  type="button"
+                  onClick={() => remove(index)}
+                  disabled={fields.length === 1}
+                  className="flex items-center justify-center w-8 h-8 mt-0.5 text-slate-400 hover:text-red-500 disabled:opacity-30 transition-colors rounded"
+                  title="Eliminar línea"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Botón agregar línea */}
+        <div className="px-5 py-3 border-t border-slate-100">
+          <button
+            type="button"
+            onClick={() =>
+              append({ description: "", quantity: 1, unitPrice: 0, itemType: "DEVELOPMENT", warrantyTerm: "" })
+            }
+            className="flex items-center gap-2 text-sm text-blue-600 hover:text-blue-800 transition-colors"
+          >
+            <Plus className="w-4 h-4" />
+            Agregar línea
+          </button>
+        </div>
+      </div>
+
+      {/* ── Totales + Impuestos + Notas ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Notas */}
+        <div className="bg-white rounded-xl border border-slate-200 p-5">
+          <label className="block text-sm font-semibold text-slate-900 mb-3">
+            Notas (opcionales)
+          </label>
+          <textarea
+            {...register("notes")}
+            rows={4}
+            placeholder="Observaciones, garantía, instrucciones de pago..."
+            className={inputClass(false)}
+          />
+        </div>
+
+        {/* Totales */}
+        <div className="bg-white rounded-xl border border-slate-200 p-5">
+          <h2 className="font-semibold text-slate-900 mb-4">Resumen</h2>
+
+          {/* Tasa de impuesto (editable) */}
+          <div className="flex items-center justify-between text-sm mb-4">
+            <label className="text-slate-600">
+              Tasa de impuestos (TPS+TVQ)
+            </label>
+            <div className="flex items-center gap-1">
+              <input
+                {...register("taxRate", { valueAsNumber: true })}
+                type="number"
+                min={0}
+                max={1}
+                step="0.00001"
+                className="w-24 text-right border border-slate-300 rounded px-2 py-1 text-sm"
+              />
+              <span className="text-slate-500 text-sm">({combinedPct}%)</span>
+            </div>
+          </div>
+
+          <div className="space-y-2 text-sm border-t border-slate-100 pt-3">
+            <div className="flex justify-between">
+              <span className="text-slate-600">Subtotal</span>
+              <span className="text-slate-900">${subtotal.toFixed(2)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-slate-600">TPS ({tpsPct}%)</span>
+              <span className="text-slate-900">${tpsAmount.toFixed(2)}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-slate-600">TVQ ({tvqPct}%)</span>
+              <span className="text-slate-900">${tvqAmount.toFixed(2)}</span>
+            </div>
+            <div className="flex justify-between text-slate-500">
+              <span className="text-xs">Total impuestos ({combinedPct}%)</span>
+              <span className="text-xs">${taxAmount.toFixed(2)}</span>
+            </div>
+            <div className="flex justify-between items-center border-t border-slate-200 pt-3 mt-3">
+              <span className="font-semibold text-slate-900">Total CAD</span>
+              <span className="text-xl font-bold text-blue-600">
+                ${total.toFixed(2)}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Acciones ── */}
+      <div className="flex items-center gap-3">
+        <button
+          type="submit"
+          disabled={isPending}
+          className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-medium px-6 py-2.5 rounded-lg text-sm transition-colors"
+        >
+          {isPending
+            ? "Guardando..."
+            : mode === "edit"
+            ? "Guardar cambios"
+            : isQuote
+            ? "Crear cotización borrador"
+            : "Crear factura borrador"}
+        </button>
+        <a
+          href={cancelHref}
+          className="text-sm text-slate-500 hover:text-slate-800 transition-colors"
+        >
+          Cancelar
+        </a>
+      </div>
+    </form>
+  );
+}
+
+function inputClass(hasError: boolean) {
+  return [
+    "w-full px-3 py-2 border rounded-lg text-sm",
+    "focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent",
+    hasError ? "border-red-400 bg-red-50" : "border-slate-300",
+  ].join(" ");
+}
+
+function selectClass(hasError: boolean) {
+  return [
+    "w-full px-3 py-2 border rounded-lg text-sm bg-white",
+    "focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent",
+    hasError ? "border-red-400 bg-red-50" : "border-slate-300",
+  ].join(" ");
+}

@@ -1,0 +1,534 @@
+// Prisma Schema — GABAN Agency Management
+// Documentación: https://pris.ly/d/prisma-schema
+
+// Prisma v7: motor WASM, conexión via @prisma/adapter-pg (ver src/lib/db.ts)
+// La URL se provee en el constructor de PrismaClient, no aquí
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  schemas  = ["mecanico"]
+}
+
+// ─────────────────────────────────────────
+// SHOP — Multi-tenant root
+// ─────────────────────────────────────────
+model Shop {
+  @@schema("mecanico")
+
+  id        String   @id @default(cuid())
+  name      String
+  logoUrl   String?
+  address   String?
+  phone     String?
+  email     String?  // contacto principal / fallback reply-to
+  billingEmail    String?  // billing@ — facturas, contabilidad
+  infoEmail       String?  // info@ — recordatorios, web
+  providersEmail  String?  // providers@ — futuro
+  newsletterEmail String?  // newsletter@ — futuro (Brevo/Mailchimp)
+  taxId     String?      // NEQ / TPS / TVQ
+  currency  String   @default("CAD")
+  appointmentReminderHours  Int     @default(24)
+  appointmentEmailsEnabled  Boolean @default(true)
+  slug                      String? @unique // URL pública: /book/mi-taller
+  bookingEnabled            Boolean @default(false)
+  timezone                  String  @default("America/Montreal")
+  bookingSlotMinutes        Int     @default(60)
+  bookingLeadTimeHours      Int     @default(24)
+  bookingAdvanceDays        Int     @default(30)
+  createdAt DateTime @default(now())
+
+  users         User[]
+  workingHours  ShopWorkingHours[]
+  clients       Client[]
+  invoices      Invoice[]
+  quotes        Quote[]
+  appointments  Appointment[]
+  reminders     ServiceReminder[]
+  documents        AccountingDocument[]
+  savedLineItems   SavedLineItem[]
+  billingProfiles  BillingProfile[]
+}
+
+// Entidad legal de facturación (GABAN Solutions, Montreal Spider Co., etc.)
+model BillingProfile {
+  @@schema("mecanico")
+
+  id            String   @id @default(cuid())
+  shopId        String
+  shop          Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  legalName     String
+  code          String   // identificador corto: gaban, msc
+  invoicePrefix String   // prefijo numeración: INV-GABAN
+  logoUrl       String?
+  address       String?
+  phone         String?
+  taxId         String?
+  billingEmail  String?
+  infoEmail     String?
+  isDefault     Boolean  @default(false)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  invoices Invoice[]
+  quotes   Quote[]
+
+  @@unique([shopId, code])
+}
+
+// ─────────────────────────────────────────
+// USER — Mechanic shop staff
+// ─────────────────────────────────────────
+model User {
+  @@schema("mecanico")
+
+  id           String   @id @default(cuid())
+  shopId       String?  // null = administrador de plataforma (sin taller)
+  shop         Shop?    @relation(fields: [shopId], references: [id])
+  name         String
+  email        String   @unique
+  passwordHash String?
+  role         Role     @default(MECHANIC)
+  bookable     Boolean  @default(true) // aparece en reservas web
+  createdAt    DateTime @default(now())
+
+  // NextAuth required
+  accounts     Account[]
+  sessions     Session[]
+  appointments Appointment[] @relation("AppointmentMechanic")
+}
+
+enum Role {
+  @@schema("mecanico")
+
+  SUPER_ADMIN // Administra la plataforma
+  OWNER       // Administrador de la agencia
+  MEMBER      // Puede crear y editar facturas/cotizaciones
+  MECHANIC    // Legacy — migrar a MEMBER
+  VIEWER
+}
+
+// ─────────────────────────────────────────
+// NEXTAUTH — Required tables
+// ─────────────────────────────────────────
+model Account {
+  @@schema("mecanico")
+
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  @@schema("mecanico")
+
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  @@schema("mecanico")
+
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ─────────────────────────────────────────
+// CLIENT
+// ─────────────────────────────────────────
+model Client {
+  @@schema("mecanico")
+
+  id        String   @id @default(cuid())
+  shopId    String
+  shop      Shop     @relation(fields: [shopId], references: [id])
+  firstName String
+  lastName  String? // opcional — empresas usan solo firstName
+  email     String?
+  phone     String?
+  address   String?
+  notes     String?  @db.Text
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  vehicles     Vehicle[]
+  invoices     Invoice[]
+  quotes       Quote[]
+  appointments Appointment[]
+}
+
+// ─────────────────────────────────────────
+// VEHICLE
+// ─────────────────────────────────────────
+model Vehicle {
+  @@schema("mecanico")
+
+  id           String      @id @default(cuid())
+  clientId     String
+  client       Client      @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  make         String
+  model        String
+  year         Int
+  licensePlate String
+  vin          String?
+  color        String?
+  mileageUnit  MileageUnit @default(KM)
+  createdAt    DateTime    @default(now())
+
+  invoices     Invoice[]
+  quotes       Quote[]
+  appointments Appointment[]
+  reminders    ServiceReminder[]
+}
+
+enum MileageUnit {
+  @@schema("mecanico")
+
+  KM
+  MILES
+}
+
+// ─────────────────────────────────────────
+// INVOICE
+// ─────────────────────────────────────────
+model Invoice {
+  @@schema("mecanico")
+
+  id            String        @id @default(cuid())
+  shopId        String
+  shop          Shop          @relation(fields: [shopId], references: [id])
+  clientId         String
+  client           Client          @relation(fields: [clientId], references: [id])
+  billingProfileId String?
+  billingProfile   BillingProfile? @relation(fields: [billingProfileId], references: [id])
+  vehicleId        String?
+  vehicle          Vehicle?        @relation(fields: [vehicleId], references: [id])
+  projectName      String?
+  invoiceNumber    String // e.g. "INV-GABAN-0042" — unique per shop
+  status        InvoiceStatus @default(SENT)
+  issuedAt      DateTime      @default(now())
+  dueAt         DateTime?
+  paidAt        DateTime?
+  sentAt        DateTime?     // primera vez registrada como pendiente (SENT)
+  emailSentAt   DateTime?     // último envío por correo al cliente
+  emailSendCount Int          @default(0)
+  subtotal      Decimal         @db.Decimal(10, 2)
+  taxRate       Decimal         @db.Decimal(6, 5) // 0.14975 = TPS+TVQ Quebec
+  taxAmount     Decimal         @db.Decimal(10, 2)
+  total         Decimal         @db.Decimal(10, 2)
+  language      InvoiceLanguage @default(ES)
+  notes         String?         @db.Text
+  pdfUrl        String?       // Supabase Storage URL
+  mileageIn     Int?
+  mileageOut    Int?
+  paymentMode   InvoicePaymentMode?
+  recordedRevenue Decimal?      @db.Decimal(10, 2) // ingresos reales (efectivo sin impuestos, tarjeta con impuestos)
+  paymentExtraPaths Json        @default("[]") // PDFs/fotos extra (alineación, etc.) — van en paquete PDF
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  lineItems       InvoiceLineItem[]
+  paymentEntries  InvoicePaymentEntry[]
+
+  @@unique([shopId, invoiceNumber])
+}
+
+enum InvoicePaymentMode {
+  @@schema("mecanico")
+
+  CARD
+  CASH
+  MIXED
+}
+
+model InvoicePaymentEntry {
+  @@schema("mecanico")
+
+  id           String                    @id @default(cuid())
+  invoiceId    String
+  invoice      Invoice                   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  method       InvoicePaymentEntryMethod
+  amount       Decimal                   @db.Decimal(10, 2)
+  receiptPath  String?                   // comprobante terminal (tarjeta)
+  sortOrder    Int                       @default(0)
+  createdAt    DateTime                  @default(now())
+}
+
+enum InvoicePaymentEntryMethod {
+  @@schema("mecanico")
+
+  CARD
+  CASH
+}
+
+enum InvoiceStatus {
+  @@schema("mecanico")
+
+  DRAFT
+  SENT
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+enum InvoiceLanguage {
+  @@schema("mecanico")
+
+  ES
+  EN
+  FR
+}
+
+model InvoiceLineItem {
+  @@schema("mecanico")
+
+  id          String       @id @default(cuid())
+  invoiceId   String
+  invoice     Invoice      @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  description String
+  quantity    Decimal      @db.Decimal(8, 2)
+  unitPrice   Decimal      @db.Decimal(10, 2)
+  lineTotal   Decimal      @db.Decimal(10, 2)
+  itemType    LineItemType @default(LABOUR)
+  warrantyTerm String?
+  sortOrder   Int          @default(0)
+}
+
+// Conceptos frecuentes del taller — autocompletado al facturar
+model SavedLineItem {
+  @@schema("mecanico")
+
+  id          String       @id @default(cuid())
+  shopId      String
+  shop        Shop         @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  description String
+  itemType    LineItemType @default(LABOUR)
+  unitPrice   Decimal      @db.Decimal(10, 2)
+  useCount    Int          @default(1)
+  lastUsedAt  DateTime     @default(now()) @updatedAt
+
+  @@unique([shopId, description])
+}
+
+enum LineItemType {
+  @@schema("mecanico")
+
+  LABOUR
+  PART
+  DEVELOPMENT
+  DESIGN
+  HOSTING
+  MAINTENANCE
+  CONSULTING
+  OTHER
+}
+
+// ─────────────────────────────────────────
+// QUOTE (COTIZACIÓN)
+// ─────────────────────────────────────────
+model Quote {
+  @@schema("mecanico")
+
+  id                  String       @id @default(cuid())
+  shopId              String
+  shop                Shop         @relation(fields: [shopId], references: [id])
+  clientId         String
+  client           Client          @relation(fields: [clientId], references: [id])
+  billingProfileId String?
+  billingProfile   BillingProfile? @relation(fields: [billingProfileId], references: [id])
+  vehicleId        String?
+  vehicle          Vehicle?        @relation(fields: [vehicleId], references: [id])
+  projectName      String?
+  quoteNumber      String
+  status              QuoteStatus  @default(DRAFT)
+  issuedAt            DateTime     @default(now())
+  validUntil          DateTime?
+  sentAt              DateTime?
+  emailSentAt         DateTime?
+  emailSendCount      Int          @default(0)
+  convertedInvoiceId  String?      @unique
+  subtotal            Decimal      @db.Decimal(10, 2)
+  taxRate             Decimal      @db.Decimal(6, 5)
+  taxAmount           Decimal      @db.Decimal(10, 2)
+  total               Decimal      @db.Decimal(10, 2)
+  language            InvoiceLanguage @default(ES)
+  notes               String?      @db.Text
+  mileageIn           Int?
+  mileageOut          Int?
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+
+  lineItems QuoteLineItem[]
+
+  @@unique([shopId, quoteNumber])
+}
+
+enum QuoteStatus {
+  @@schema("mecanico")
+
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CONVERTED
+  CANCELLED
+}
+
+model QuoteLineItem {
+  @@schema("mecanico")
+
+  id           String       @id @default(cuid())
+  quoteId      String
+  quote        Quote        @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+  description  String
+  quantity     Decimal      @db.Decimal(8, 2)
+  unitPrice    Decimal      @db.Decimal(10, 2)
+  lineTotal    Decimal      @db.Decimal(10, 2)
+  itemType     LineItemType @default(LABOUR)
+  warrantyTerm String?
+  sortOrder    Int          @default(0)
+}
+
+// ─────────────────────────────────────────
+// APPOINTMENT (CITAS)
+// ─────────────────────────────────────────
+model Appointment {
+  @@schema("mecanico")
+
+  id                   String            @id @default(cuid())
+  shopId               String
+  shop                 Shop              @relation(fields: [shopId], references: [id])
+  clientId             String
+  client               Client            @relation(fields: [clientId], references: [id])
+  vehicleId            String?
+  vehicle              Vehicle?          @relation(fields: [vehicleId], references: [id])
+  mechanicId           String?
+  mechanic             User?             @relation("AppointmentMechanic", fields: [mechanicId], references: [id])
+  title                String
+  startsAt             DateTime
+  endsAt               DateTime
+  durationMinutes      Int
+  status               AppointmentStatus @default(SCHEDULED)
+  notes                String?           @db.Text
+  confirmationSentAt   DateTime?
+  reminderSentAt       DateTime?
+  cancellationSentAt   DateTime?
+  source               AppointmentSource @default(INTERNAL)
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+}
+
+enum AppointmentSource {
+  @@schema("mecanico")
+
+  INTERNAL
+  PUBLIC_WEB
+}
+
+enum AppointmentStatus {
+  @@schema("mecanico")
+
+  SCHEDULED
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+// Horario de apertura del taller (0 = domingo … 6 = sábado)
+model ShopWorkingHours {
+  @@schema("mecanico")
+
+  id        String  @id @default(cuid())
+  shopId    String
+  shop      Shop    @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  dayOfWeek Int     // 0–6, alineado con Date.getDay()
+  openTime  String  // "08:00"
+  closeTime String  // "17:00"
+  isClosed  Boolean @default(false)
+
+  @@unique([shopId, dayOfWeek])
+}
+
+// ─────────────────────────────────────────
+// SERVICE REMINDER
+// ─────────────────────────────────────────
+model ServiceReminder {
+  @@schema("mecanico")
+
+  id          String         @id @default(cuid())
+  shopId      String
+  shop        Shop           @relation(fields: [shopId], references: [id])
+  vehicleId   String
+  vehicle     Vehicle        @relation(fields: [vehicleId], references: [id])
+  serviceType String         // "Cambio de aceite", "Frenos", etc.
+  dueMileage  Int?
+  dueDate     DateTime?
+  notes       String?
+  status      ReminderStatus @default(PENDING)
+  sentAt      DateTime?
+  createdAt   DateTime       @default(now())
+}
+
+enum ReminderStatus {
+  @@schema("mecanico")
+
+  PENDING
+  SENT
+  ACKNOWLEDGED
+  DISMISSED
+}
+
+// ─────────────────────────────────────────
+// ACCOUNTING DOCUMENT
+// ─────────────────────────────────────────
+model AccountingDocument {
+  @@schema("mecanico")
+
+  id            String      @id @default(cuid())
+  shopId        String
+  shop          Shop        @relation(fields: [shopId], references: [id])
+  category      DocCategory
+  fileName      String
+  storagePath   String      // Supabase Storage path (backup)
+  driveFileId   String?     // Google Drive file ID
+  driveFolderId String?
+  uploadedAt    DateTime    @default(now())
+  uploadedById  String?
+  notes         String?
+}
+
+enum DocCategory {
+  @@schema("mecanico")
+
+  INVOICES
+  RECEIPTS
+  PAYROLL
+  TAX_DOCUMENTS
+  BANK_STATEMENTS
+  OTHER
+}

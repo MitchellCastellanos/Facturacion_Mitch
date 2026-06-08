@@ -1,0 +1,91 @@
+/**
+ * Inicializa esquema + super admin + agencia GABAN.
+ * Uso (con DATABASE_URL en .env):
+ *   npx tsx scripts/bootstrap-platform.ts
+ *
+ * Variables opcionales:
+ *   PLATFORM_ADMIN_EMAIL, PLATFORM_ADMIN_PASSWORD, PLATFORM_ADMIN_NAME
+ */
+import "dotenv/config";
+import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
+import bcrypt from "bcryptjs";
+import { execSync } from "child_process";
+import { BRAND } from "../src/config/brand";
+import { seedBillingProfiles } from "../src/lib/seed-billing-profiles";
+
+const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL ?? "" });
+const prisma = new PrismaClient({ adapter });
+
+const ADMIN_EMAIL = (process.env.PLATFORM_ADMIN_EMAIL ?? "mitchell.castellanos@hotmail.com").toLowerCase();
+const ADMIN_PASSWORD = process.env.PLATFORM_ADMIN_PASSWORD ?? "";
+const ADMIN_NAME = process.env.PLATFORM_ADMIN_NAME ?? "Mitchell Castellanos";
+
+async function main() {
+  if (!process.env.DATABASE_URL) {
+    console.error("❌ Falta DATABASE_URL en .env");
+    process.exit(1);
+  }
+  if (!ADMIN_PASSWORD) {
+    console.error("❌ Define PLATFORM_ADMIN_PASSWORD en .env (no se guarda en el repo)");
+    process.exit(1);
+  }
+
+  if (process.env.SKIP_DB_PUSH !== "1") {
+    console.log("📦 Aplicando esquema (prisma db push)...");
+    execSync("npx prisma db push", { stdio: "inherit" });
+  }
+
+  console.log("👤 Creando super admin de plataforma...");
+  const hash = await bcrypt.hash(ADMIN_PASSWORD, 12);
+  await prisma.user.upsert({
+    where: { email: ADMIN_EMAIL },
+    update: {
+      name: ADMIN_NAME,
+      passwordHash: hash,
+      role: "SUPER_ADMIN",
+      shopId: null,
+    },
+    create: {
+      name: ADMIN_NAME,
+      email: ADMIN_EMAIL,
+      passwordHash: hash,
+      role: "SUPER_ADMIN",
+      shopId: null,
+    },
+  });
+
+  const shop = await prisma.shop.upsert({
+    where: { id: BRAND.shopId },
+    update: {
+      name: BRAND.shopName,
+      email: BRAND.emails.contact,
+      billingEmail: BRAND.emails.billing,
+      infoEmail: BRAND.emails.info,
+      slug: BRAND.bookingSlug,
+    },
+    create: {
+      id: BRAND.shopId,
+      name: BRAND.shopName,
+      phone: "",
+      email: BRAND.emails.contact,
+      billingEmail: BRAND.emails.billing,
+      infoEmail: BRAND.emails.info,
+      slug: BRAND.bookingSlug,
+      currency: "CAD",
+    },
+  });
+
+  await seedBillingProfiles(prisma, shop.id);
+
+  console.log(`✅ Super admin: ${ADMIN_EMAIL}`);
+  console.log(`✅ Agencia lista: ${shop.name} (${BRAND.billingProfiles.length} perfiles de facturación)`);
+  console.log("\n🎉 Listo. Entra en /login → te manda a /admin");
+}
+
+main()
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  })
+  .finally(() => prisma.$disconnect());
